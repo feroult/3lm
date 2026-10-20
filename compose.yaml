@@ -1,0 +1,58 @@
+# podman-compose / docker-compose.
+#   GPU (default):  podman-compose up -d coder-llm        (host 8080; HOST_PORT=8000 if 8080 is taken)
+#   CPU:            podman-compose --profile cpu up -d coder-llm-cpu   (host 8081; no GPU flags)
+# GPU on WSL2: /dev/dxg + /usr/lib/wsl.  On native Linux, replace the GPU service's 'devices'/'volumes' with:
+#   devices: ["nvidia.com/gpu=all"]   (podman CDI)   or   deploy.resources.reservations.devices (docker)
+x-env: &env
+  MODEL: ${MODEL:-}
+  CTX_SIZE: ${CTX_SIZE:-}
+  API_KEY: ${API_KEY:-}
+  HF_TOKEN: ${HF_TOKEN:-}
+  EXTRA_ARGS: ${EXTRA_ARGS:-}
+  PORT: "8080"
+
+services:
+  coder-llm:
+    image: coder-llm:latest
+    build: .
+    container_name: coder-llm
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - models:/models
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+    shm_size: 1gb
+    environment:
+      <<: *env
+      DEVICE: gpu
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      N_CPU_MOE: ${N_CPU_MOE:-}        # MoE layers whose experts stay on the CPU (model default: 32)
+      N_GPU_LAYERS: ${N_GPU_LAYERS:-}  # qwen3.8-27b-hybrid only
+      SPEC_N_MAX: ${SPEC_N_MAX:-}      # MTP draft tokens (default 3)
+      THREADS: ${THREADS:-}
+      FIT_TARGET: ${FIT_TARGET:-}
+
+  coder-llm-cpu:
+    profiles: ["cpu"]
+    image: coder-llm:latest
+    build: .
+    container_name: coder-llm-cpu
+    restart: unless-stopped
+    ports:
+      - "${CPU_HOST_PORT:-8081}:8080"
+    volumes:
+      - models:/models
+    shm_size: 1gb
+    environment:
+      <<: *env
+      DEVICE: cpu
+      THREADS: ${THREADS:-}     # empty = physical cores
+      MLOCK: ${MLOCK:-}
+      NO_MMAP: ${NO_MMAP:-}
+
+volumes:
+  models:
+    name: ${VOLUME:-llm-models}

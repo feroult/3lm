@@ -1,0 +1,166 @@
+# Model catalog (llama-swap format). Each model is loaded on demand when the request's "model" field references it;
+# the model selected by MODEL (default qwen3.6-35b-a3b-64k) is preloaded at startup.
+# {{VAR:default}} tokens are replaced at startup by environment variables (CTX_SIZE, N_CPU_MOE, EXTRA_ARGS, ...).
+# serve-model.sh downloads the GGUFs from Hugging Face (resumable, skipped if present) and then execs llama-server.
+
+healthCheckTimeout: 14400     # the first use may include a large download
+logLevel: info
+logToStdout: both
+startPort: 5800
+
+macros:
+  common: >-
+    --jinja --reasoning-format deepseek -fa on -np 1 --no-mmproj {{EXTRA_ARGS:}}
+  qwen_think: "--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0"
+  # CPU: f16 KV cache (q8_0 on CPU made prefill 4x slower, measured); -ngl 0/--no-kv-offload/-t/--load-mode come from the entrypoint (DEVICE=cpu) via EXTRA_ARGS; larger -b/-ub speed up prefill
+  cpu: "-b 2048 -ub 512"
+  qwen_nothink: "--reasoning off --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --presence-penalty 1.5"
+
+models:
+  # ---------------- DEFAULT: long context + spare VRAM (for calls/games) ----------------
+  # MoE with 3B active parameters: experts in RAM, attention + KV cache on the GPU. Measured on an RTX 5070 Ti (N_CPU_MOE=30, 64k ctx, q8 KV):
+  # ~38 t/s, prefill ~560 t/s (1.5k prompt), ~11.4GB total VRAM (~4.9GB free). N_CPU_MOE=40 -> 128k ctx, ~31 t/s, ~5.6GB VRAM.
+  # MTP (GGUF unsloth/Qwen3.6-35B-A3B-MTP-GGUF, --spec-type draft-mtp, -np 1 required): ~50 t/s (baseline ~40), prefill ~1000-1180 t/s with -ub 2048, ~13.1-13.3GB total VRAM (6k and 21k ctx).
+  # Measured (during a Meet call): n-max 3 is ~2 t/s above n-max 2; N_CPU_MOE=32 gives back ~1.4GB of VRAM for ~2 t/s. Without MTP: -t 12 is best (24 threads drops to 19 t/s), f16 KV does not help, n-gram does not help.
+  # Coding quality is below Qwen3.8-27B / Flash-Next according to third-party benchmarks (not verified).
+  "qwen3.6-35b-a3b-64k":
+    aliases: ["coder", "default", "gpt-4o", "gpt-4"]
+    name: "Qwen3.6-35B-A3B UD-Q6_K + MTP - default: 64k context, experts on CPU, ~3GB free VRAM"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.6-35B-A3B-MTP-GGUF --file Qwen3.6-35B-A3B-UD-Q6_K.gguf=Qwen3.6-35B-A3B-MTP-UD-Q6_K.gguf --
+      -m /models/Qwen3.6-35B-A3B-MTP-UD-Q6_K.gguf --alias qwen3.6-35b-a3b-64k --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --n-cpu-moe {{N_CPU_MOE:32}} --fit off -c {{CTX_SIZE:65536}} -ctk q8_0 -ctv q8_0
+      -t {{THREADS:12}} -tb {{THREADS:12}} -b 4096 -ub 2048
+      --spec-type draft-mtp --spec-draft-n-max {{SPEC_N_MAX:3}} --spec-draft-p-min 0.7
+      ${qwen_think} ${common}
+
+  # Same model WITHOUT MTP (file without MTP heads, 29GB): ~40 t/s, uses ~0.3GB less VRAM. Fallback if MTP causes problems.
+  "qwen3.6-35b-a3b-64k-nomtp":
+    name: "Qwen3.6-35B-A3B UD-Q6_K without MTP - 64k context, experts on CPU"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.6-35B-A3B-GGUF --file Qwen3.6-35B-A3B-UD-Q6_K.gguf --
+      -m /models/Qwen3.6-35B-A3B-UD-Q6_K.gguf --alias qwen3.6-35b-a3b-64k-nomtp --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --n-cpu-moe {{N_CPU_MOE:30}} --fit off -c {{CTX_SIZE:65536}} -ctk q8_0 -ctv q8_0
+      -t {{THREADS:12}} -tb {{THREADS:12}} -b 4096 -ub 2048
+      ${qwen_think} ${common}
+
+  # ---------------- best quality that fits the GPU: dense Qwen3.8-27B, 100% in VRAM (no headroom) ----------------
+  # Measured on an RTX 5070 Ti: 24k ctx + q8 KV = 46 t/s; 32k ctx q8 = ~5 t/s (overflows VRAM). Do not raise CTX_SIZE without measuring.
+  "qwen3.8-27b":
+    name: "Qwen3.8-27B (dense) UD-IQ4_XS - 100% GPU, 24k ctx, uses the whole card"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.8-27B-GGUF --file Qwen3.8-27B-UD-IQ4_XS.gguf --
+      -m /models/Qwen3.8-27B-UD-IQ4_XS.gguf --alias qwen3.8-27b --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --fit off -c {{CTX_SIZE:24576}} -ctk q8_0 -ctv q8_0
+      ${qwen_think} ${common}
+
+  # HYBRID: Qwen3.8-27B with 10 of 65 layers on the CPU to leave ~2GB of VRAM free (calibrated on an RTX 5070 Ti, 32k ctx, q8 KV):
+  # ~15 t/s, prefill ~1100 t/s. Reference: ngl 61 -> 23 t/s (0.8GB free), ngl 58 -> 18 t/s, ngl 55 -> 15 t/s, ngl 52 -> 13 t/s (2.5GB free).
+  # Each CPU layer frees ~0.22GB; 64k ctx costs ~1GB more VRAM than 32k. Tune with N_GPU_LAYERS.
+  "qwen3.8-27b-hybrid":
+    name: "Qwen3.8-27B UD-IQ4_XS hybrid GPU+CPU (32k ctx, ~2GB free VRAM, ~15 t/s)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.8-27B-GGUF --file Qwen3.8-27B-UD-IQ4_XS.gguf --
+      -m /models/Qwen3.8-27B-UD-IQ4_XS.gguf --alias qwen3.8-27b-hybrid --host 127.0.0.1 --port ${PORT}
+      -ngl {{N_GPU_LAYERS:55}} --fit off -c {{CTX_SIZE:32768}} -ctk q8_0 -ctv q8_0
+      -t {{THREADS:12}} -tb {{THREADS:12}} -b 4096 -ub 1024
+      ${qwen_think} ${common}
+
+  # same file, no reasoning (faster, good for editing/chat); switching models reloads the server
+  "qwen3.8-27b-instant":
+    name: "Qwen3.8-27B without thinking"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.8-27B-GGUF --file Qwen3.8-27B-UD-IQ4_XS.gguf --
+      -m /models/Qwen3.8-27B-UD-IQ4_XS.gguf --alias qwen3.8-27b-instant --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --fit off -c {{CTX_SIZE:24576}} -ctk q8_0 -ctv q8_0
+      ${qwen_nothink} ${common}
+
+  # larger quant (16.5GB): a few layers spill to RAM via --fit; slightly better quality, slower
+  "qwen3.8-27b-q4km":
+    name: "Qwen3.8-27B UD-Q4_K_M (higher quality, spills into RAM)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.8-27B-GGUF --file Qwen3.8-27B-UD-Q4_K_M.gguf --
+      -m /models/Qwen3.8-27B-UD-Q4_K_M.gguf --alias qwen3.8-27b-q4km --host 127.0.0.1 --port ${PORT}
+      --fit on --fit-target {{FIT_TARGET:512}} --fit-ctx 32768 -c {{CTX_SIZE:24576}} -ctk q8_0 -ctv q8_0
+      ${qwen_think} ${common}
+
+  # ---------------- OPTIONAL: giant MoE using RAM (needs ~90GB of RAM; .wslconfig memory>=90GB) ----------------
+  "qwen3.8-flash-next":
+    name: "Qwen3.8-Flash-Next 125B-A6B UD-IQ3_XXS (experts in RAM, ~82GB) - best quality; 64k, ~25 t/s, ~6GB free VRAM"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.8-Flash-Next-GGUF
+      --file UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf
+      --file UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf
+      --file UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf --
+      -m /models/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf --alias qwen3.8-flash-next
+      --host 127.0.0.1 --port ${PORT} --fit on --fit-target {{FIT_TARGET:6144}} --fit-ctx {{CTX_SIZE:65536}} -c {{CTX_SIZE:65536}}
+      -t {{THREADS:12}} -tb {{THREADS:12}} -b 4096 -ub 1024
+      -ctk q8_0 -ctv q8_0 ${qwen_think}
+      --chat-template-kwargs '{"reasoning_effort":"medium"}' ${common}
+
+  # ---------------- OPTIONAL: fast, 3B-active MoE ----------------
+  "qwen3.6-35b-a3b":
+    name: "Qwen3.6-35B-A3B UD-Q4_K_M (fast, experts partly in RAM)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.6-35B-A3B-GGUF --file Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --
+      -m /models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --alias qwen3.6-35b-a3b --host 127.0.0.1 --port ${PORT}
+      --fit on --fit-target {{FIT_TARGET:512}} -c {{CTX_SIZE:131072}} -ctk q8_0 -ctv q8_0
+      ${qwen_think} ${common}
+
+  # ---------------- OPTIONAL: light, low latency ----------------
+  "gpt-oss-20b":
+    name: "gpt-oss-20b MXFP4 (fast, 100% GPU)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo ggml-org/gpt-oss-20b-GGUF --file gpt-oss-20b-MXFP4.gguf --
+      -m /models/gpt-oss-20b-MXFP4.gguf --alias gpt-oss-20b --host 127.0.0.1 --port ${PORT}
+      -ngl 99 -c {{CTX_SIZE:131072}} --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0
+      --chat-template-kwargs '{"reasoning_effort":"medium"}' ${common}
+
+  # ---------------- CPU MODE (DEVICE=cpu / ./run.sh --cpu): sparse MoE, only ~3B active parameters per token ----------------
+  # CPU default: Qwen3-Coder-30B-A3B-Instruct Q4_K_M (18.6GB of RAM + KV). No thinking.
+  "qwen3-coder-30b-a3b-cpu":
+    aliases: ["coder", "default", "gpt-4o", "gpt-4"]
+    name: "Qwen3-Coder-30B-A3B Q4_K_M (CPU, ~19GB RAM)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF --file Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --
+      -m /models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --alias qwen3-coder-30b-a3b-cpu --host 127.0.0.1 --port ${PORT}
+      -c {{CTX_SIZE:32768}} -ctk f16 -ctv f16 --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --repeat-penalty 1.05
+      ${cpu} ${common}
+
+  # Same model in IQ4_XS (smaller, ~16.5GB) for low-RAM machines
+  "qwen3-coder-30b-a3b-cpu-small":
+    name: "Qwen3-Coder-30B-A3B IQ4_XS (CPU, ~17GB RAM)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF --file Qwen3-Coder-30B-A3B-Instruct-IQ4_XS.gguf --
+      -m /models/Qwen3-Coder-30B-A3B-Instruct-IQ4_XS.gguf --alias qwen3-coder-30b-a3b-cpu-small --host 127.0.0.1 --port ${PORT}
+      -c {{CTX_SIZE:32768}} -ctk f16 -ctv f16 --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 --repeat-penalty 1.05
+      ${cpu} ${common}
+
+  # Qwen3.6-35B-A3B with thinking (slower per answer, better reasoning); Q6_K ~29GB RAM
+  "qwen3.6-35b-a3b-cpu":
+    name: "Qwen3.6-35B-A3B UD-Q6_K (CPU, ~30GB RAM, thinking)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3.6-35B-A3B-GGUF --file Qwen3.6-35B-A3B-UD-Q6_K.gguf --
+      -m /models/Qwen3.6-35B-A3B-UD-Q6_K.gguf --alias qwen3.6-35b-a3b-cpu --host 127.0.0.1 --port ${PORT}
+      -c {{CTX_SIZE:32768}} -ctk f16 -ctv f16 ${qwen_think} ${cpu} ${common}
+
+  # ---------------- plumbing smoke test (0.4GB) ----------------
+  "smoke":
+    name: "Qwen3-0.6B Q4_K_M (quick test)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >-
+      serve-model.sh --repo unsloth/Qwen3-0.6B-GGUF --file Qwen3-0.6B-Q4_K_M.gguf --
+      -m /models/Qwen3-0.6B-Q4_K_M.gguf --alias smoke --host 127.0.0.1 --port ${PORT}
+      -ngl 99 -c {{CTX_SIZE:8192}} ${common}

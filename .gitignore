@@ -1,0 +1,18 @@
+# models and partial downloads (they live in the podman volume, not in the repository)
+*.gguf
+*.part
+models/
+
+# secrets and local environment
+.env
+*.key
+id_ed25519*
+
+# editor / python junk
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+
+# raw benchmark outputs
+bench/out/
